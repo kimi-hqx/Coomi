@@ -1,0 +1,206 @@
+name: CoomiDev APK
+
+# 用法：把分支推到 fork（codex/custom-* 会自动触发），或在 Actions 页面手动 Run workflow。
+# 产物：CoomiDev-<version>-debug-arm64-v8a.apk（包名 com.coomidev.android，独立于正式版 com.coomi.android）
+#
+# 本工作流只做「构建 + 校验 + 上传产物」，不发布 Release、不签署正式密钥。
+# 预览包使用仓库内已公开、且被明确标注为不受信任的 testkey_untrusted.jks（其口令是
+# 公开信息，见仓库历史提交 97045df），仅用于可安装性验证，切勿用于正式分发。
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch/tag/SHA to build (leave empty for the triggering ref)
+        required: false
+        default: ""
+        type: string
+      upload_apk:
+        description: Upload the built APK as a workflow artifact
+        required: false
+        default: true
+        type: boolean
+  push:
+    branches:
+      - "codex/custom-*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: coomidev-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-apk:
+    name: Build CoomiDev APK
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    env:
+      COOMI_DEV_BUILD: "1"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 0
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android/sdk/ndk/*/sources \
+            /opt/ghc /usr/local/share/boost "$AGENT_TOOLSDIRECTORY/CodeQL" || true
+          df -h /
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: apps/web/package-lock.json
+
+      - name: Set up Rust 1.95.0 with the Android ARM64 target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.95.0"
+          targets: aarch64-linux-android
+          components: clippy,rustfmt
+
+      - name: Install Android SDK platform, build-tools and NDK
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          SDKMANAGER=""
+          for candidate in \
+            "$SDK/cmdline-tools/latest/bin/sdkmanager" \
+            "$SDK/cmdline-tools/bin/sdkmanager" \
+            "$SDK/tools/bin/sdkmanager"; do
+            if [ -x "$candidate" ]; then SDKMANAGER="$candidate"; break; fi
+          done
+          if [ -z "$SDKMANAGER" ]; then
+            SDKMANAGER=$(find "$SDK" -name sdkmanager -type f 2>/dev/null | head -n 1)
+          fi
+          test -x "$SDKMANAGER" || { echo "sdkmanager not found under $SDK" >&2; exit 1; }
+          yes | "$SDKMANAGER" --licenses > /dev/null 2>&1 || true
+          "$SDKMANAGER" --install \
+            "platform-tools" \
+            "platforms;android-36" \
+            "build-tools;36.0.0" \
+            "ndk;27.0.12077973"
+          echo "ANDROID_NDK_HOME=$SDK/ndk/27.0.12077973" >> "$GITHUB_ENV"
+
+      - name: Cache Gradle and Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+            ~/.cargo/registry
+            ~/.cargo/git
+            apps/coomi-rs/target
+          key: coomidev-${{ runner.os }}-${{ hashFiles('apps/coomi-rs/Cargo.lock', 'apps/web/package-lock.json', 'gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: |
+            coomidev-${{ runner.os }}-
+
+      - name: Install web dependencies
+        run: npm ci --prefix apps/web
+
+      - name: Web type-check
+        run: npm run type-check --prefix apps/web
+
+      # 前端单元测试单独一步：失败不会挡住 APK 产物，但会在日志里明确暴露。
+      - name: Web unit tests (non-blocking)
+        continue-on-error: true
+        run: npm test --prefix apps/web
+
+      - name: Download verified Runtime V2 assets
+        run: |
+          set -euo pipefail
+          MANIFEST=apps/coomi-app/app/src/main/assets/runtime-v2-manifest.json
+          mkdir -p runtime-v2-dist
+          python3 - "$MANIFEST" <<'PY' > /tmp/runtime-v2-urls.txt
+          import json, sys
+          data = json.load(open(sys.argv[1]))
+          for key, name in (("host", "proot-host-arm64.tar.gz"), ("rootfs", "ubuntu-noble-arm64.tar.gz")):
+              print(name, data[key]["url"], data[key]["sha256"], data[key]["size"])
+          PY
+          while read -r name url sha size; do
+            echo "::group::download $name"
+            curl -fL --retry 3 --retry-delay 5 -o "runtime-v2-dist/$name" "$url"
+            actual=$(sha256sum "runtime-v2-dist/$name" | cut -d' ' -f1)
+            bytes=$(stat -c%s "runtime-v2-dist/$name")
+            test "$actual" = "$sha" || { echo "sha256 mismatch for $name: $actual != $sha" >&2; exit 1; }
+            test "$bytes" = "$size" || { echo "size mismatch for $name: $bytes != $size" >&2; exit 1; }
+            echo "$name ok ($bytes bytes, sha256 $actual)"
+            echo "::endgroup::"
+          done < /tmp/runtime-v2-urls.txt
+          ls -l runtime-v2-dist
+
+      - name: Stage signing configuration
+        run: |
+          set -euo pipefail
+          # 公开的「不受信任测试密钥」口令（仓库历史里即可查到），仅用于预览包签名。
+          cat > local.properties <<'EOF'
+          coomi.signing.storePassword=xrj45yWGLbsO7W0v
+          coomi.signing.keyPassword=xrj45yWGLbsO7W0v
+          EOF
+          test -f apps/coomi-app/app/testkey_untrusted.jks
+          ls -l apps/coomi-app/app/testkey_untrusted.jks
+
+      - name: Print resolved package and version
+        run: ./gradlew --no-daemon :app:printVersionInfo
+
+      - name: Build CoomiDev APK
+        run: |
+          ./gradlew --no-daemon --max-workers=2 :app:assembleDebug
+
+      - name: Verify APK identity and signature
+        run: |
+          set -euo pipefail
+          SDK="$ANDROID_SDK_ROOT"
+          APK=$(find apps/coomi-app/app/build/outputs/apk/debug -type f -name 'CoomiDev-*.apk' | sort | tail -n 1)
+          test -n "$APK" || { echo "CoomiDev APK was not produced" >&2; exit 1; }
+          echo "APK=$APK" >> "$GITHUB_ENV"
+          echo "APK_NAME=$(basename "$APK")" >> "$GITHUB_ENV"
+          "$SDK/build-tools/36.0.0/aapt2" dump badging "$APK" | tee /tmp/badging.txt
+          grep -q "package: name='com.coomidev.android'" /tmp/badging.txt
+          grep -q "arm64-v8a" /tmp/badging.txt
+          "$SDK/build-tools/36.0.0/apksigner" verify --verbose "$APK"
+          sha256sum "$APK" | tee /tmp/apk-sha256.txt
+          unzip -l "$APK" | grep -q "lib/arm64-v8a/libcoomi.so"
+          unzip -l "$APK" | grep -q "lib/arm64-v8a/libtermux-bootstrap.so"
+          unzip -l "$APK" | grep -q "assets/runtime-v2/ubuntu-noble-arm64.tgz"
+          unzip -l "$APK" | grep -q "assets/runtime-v2/proot-host-arm64.tgz"
+          unzip -l "$APK" | grep -q "assets/web.zip"
+
+      - name: Build summary
+        run: |
+          {
+            echo "### CoomiDev APK (preview)"
+            echo
+            echo "- commit: \`${{ github.sha }}\`"
+            echo "- artifact: \`$APK_NAME\`"
+            echo "- package: \`com.coomidev.android\` / label \`CoomiDev\` / port \`18765\`"
+            echo "- signature: repository test key \`testkey_untrusted.jks\` (untrusted preview key)"
+            echo "- sha256: \`$(cut -d' ' -f1 /tmp/apk-sha256.txt)\`"
+            echo
+            echo '```'
+            cat /tmp/badging.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload APK artifact
+        if: ${{ inputs.upload_apk != false }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: coomidev-apk
+          path: apps/coomi-app/app/build/outputs/apk/debug/CoomiDev-*.apk
+          if-no-files-found: error
+          retention-days: 14
