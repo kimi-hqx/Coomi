@@ -31,6 +31,11 @@ on:
   push:
     branches:
       - "codex/custom-*"
+    paths-ignore:
+      # 纯文档/工具改动不重启 APK 构建，避免白跑一次完整流水线。
+      - "**.md"
+      - "docs/**"
+      - "tools/ci/**"
 
 permissions:
   contents: read
